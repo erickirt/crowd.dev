@@ -1,24 +1,24 @@
 DESCRIPTION >
-    - Calculates issue resolution health score based on average days to close issues.
-    - Queries `issues_analyzed` directly for optimal performance using sorting key on `segmentId, channel, openedAt`.
-    - Scores range from 0 (worst, 61+ days) to 5 (best, 0-7 days).
+    - Calculates repository-level issue resolution health score.
+    - Returns average days to close issues and benchmark (0-5) per repository.
+    - Queries `issues_analyzed` directly for optimal performance.
     - Parameters:
-    - `project`: Optional project slug for single-project mode
-    - `repos`: Optional array of repository URLs for filtering
+    - `repoUrl`: Optional repository URL for single-repo mode
     - `startDate`: Optional DateTime filter for issues opened after timestamp
     - `endDate`: Optional DateTime filter for issues opened before timestamp
 
-NODE health_score_issues_resolution_score
+TAGS "Repository health", "Metrics"
+
+NODE repo_health_score_issues_resolution_score
 SQL >
     %
-    {% if defined(project) %}
-        SELECT segmentId, round(avg(closedInSeconds) / (60 * 60 * 24)) AS issueResolution
+    {% if defined(repoUrl) %}
+        SELECT channel, round(avg(closedInSeconds) / (60 * 60 * 24)) AS issueResolution
         FROM issues_analyzed
         WHERE
-            segmentId = (SELECT segmentId FROM segments_filtered)
+            channel = {{ String(repoUrl, description="Repository URL", required=False) }}
             AND closedAt IS NOT NULL
             AND channel NOT IN (SELECT channel FROM repos_to_channels_excluded)
-            {% if defined(repos) %} AND channel IN (SELECT channel FROM repos_to_channels) {% end %}
             {% if defined(startDate) %}
                 AND openedAt
                 > {{ DateTime(startDate, description="Filter after date", required=False) }}
@@ -26,23 +26,23 @@ SQL >
             {% if defined(endDate) %}
                 AND openedAt < {{ DateTime(endDate, description="Filter before date", required=False) }}
             {% end %}
-        GROUP BY segmentId
+        GROUP BY channel
     {% else %}
-        SELECT segmentId, round(avg(closedInSeconds) / (60 * 60 * 24)) AS issueResolution
+        SELECT channel, round(avg(closedInSeconds) / (60 * 60 * 24)) AS issueResolution
         FROM issues_analyzed
         WHERE
             openedAt >= toStartOfDay(now()) - INTERVAL 365 DAY
             AND openedAt < toStartOfDay(now()) + INTERVAL 1 DAY
             AND closedAt IS NOT NULL
             AND channel NOT IN (SELECT channel FROM repos_to_channels_excluded)
-        GROUP BY segmentId
+        GROUP BY channel
     {% end %}
 
 NODE health_score_issues_resolution_benchmark
 SQL >
     %
     SELECT
-        segmentId,
+        channel,
         issueResolution,
         CASE
             WHEN issueResolution >= 61
@@ -59,4 +59,4 @@ SQL >
             THEN 5
             ELSE 0
         END AS issueResolutionBenchmark
-    FROM health_score_issues_resolution_score
+    FROM repo_health_score_issues_resolution_score

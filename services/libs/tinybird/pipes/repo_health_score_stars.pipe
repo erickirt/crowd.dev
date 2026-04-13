@@ -1,17 +1,23 @@
-NODE health_score_stars_score
 DESCRIPTION >
-    Returns activeContributors for previous quarter per project
+    - Calculates repository-level stars health score.
+    - Returns star count and benchmark (0-5) per repository.
+    - Parameters:
+    - `repoUrl`: Optional repository URL for single-repo mode
+    - `startDate`: Optional DateTime filter
+    - `endDate`: Optional DateTime filter
 
+TAGS "Repository health", "Metrics"
+
+NODE repo_health_score_stars_score
 SQL >
     %
-    {% if defined(project) %}
-        SELECT segmentId, count() AS stars
-        FROM activityRelations_bucket_routing
+    {% if defined(repoUrl) %}
+        SELECT channel, count() AS stars
+        FROM activityRelations_deduplicated_cleaned_bucket_union
         WHERE
             type = 'star'
-            AND segmentId = (SELECT segmentId FROM segments_filtered)
+            AND channel = {{ String(repoUrl, description="Repository URL", required=False) }}
             AND channel NOT IN (SELECT channel FROM repos_to_channels_excluded)
-            {% if defined(repos) %} AND channel IN (SELECT channel FROM repos_to_channels) {% end %}
             {% if defined(startDate) %}
                 AND timestamp
                 > {{ DateTime(startDate, description="Filter after date", required=False) }}
@@ -20,19 +26,19 @@ SQL >
                 AND timestamp
                 < {{ DateTime(endDate, description="Filter before date", required=False) }}
             {% end %}
-        GROUP BY segmentId
+        GROUP BY channel
     {% else %}
-        SELECT segmentId, count() AS stars
+        SELECT channel, count() AS stars
         FROM activityRelations_deduplicated_cleaned_bucket_union
         WHERE type = 'star' AND channel NOT IN (SELECT channel FROM repos_to_channels_excluded)
-        GROUP BY segmentId
+        GROUP BY channel
     {% end %}
 
 NODE health_score_stars_benchmark
 SQL >
     %
     SELECT
-        segmentId,
+        channel,
         stars,
         CASE
             WHEN stars BETWEEN 0 AND 9
@@ -49,4 +55,4 @@ SQL >
             THEN 5
             ELSE 0
         END AS starsBenchmark
-    FROM health_score_stars_score
+    FROM repo_health_score_stars_score

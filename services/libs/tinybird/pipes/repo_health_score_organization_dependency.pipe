@@ -1,15 +1,24 @@
-NODE health_score_organization_dependency_contribution_count
+DESCRIPTION >
+    - Calculates repository-level organization dependency health score.
+    - Returns the number of organizations making up 51% of contributions, their combined percentage, and benchmark (0-5).
+    - Parameters:
+    - `repoUrl`: Optional repository URL for single-repo mode
+    - `startDate`: Optional DateTime filter
+    - `endDate`: Optional DateTime filter
+
+TAGS "Repository health", "Metrics"
+
+NODE repo_health_score_organization_dependency_count
 SQL >
     %
-    {% if defined(project) %}
-        SELECT segmentId, organizationId, count() AS contributionCount
-        FROM activityRelations_bucket_routing
+    {% if defined(repoUrl) %}
+        SELECT channel, organizationId, count() AS contributionCount
+        FROM activityRelations_deduplicated_cleaned_bucket_union
         WHERE
             organizationId != ''
             AND (type, platform) IN (SELECT activityType, platform FROM activityTypes_filtered)
-            AND segmentId = (SELECT segmentId FROM segments_filtered)
+            AND channel = {{ String(repoUrl, description="Repository URL", required=False) }}
             AND channel NOT IN (SELECT channel FROM repos_to_channels_excluded)
-            {% if defined(repos) %} AND channel IN (SELECT channel FROM repos_to_channels) {% end %}
             {% if defined(startDate) %}
                 AND timestamp
                 > {{ DateTime(startDate, description="Filter after date", required=False) }}
@@ -18,9 +27,9 @@ SQL >
                 AND timestamp
                 < {{ DateTime(endDate, description="Filter before date", required=False) }}
             {% end %}
-        GROUP BY segmentId, organizationId
+        GROUP BY channel, organizationId
     {% else %}
-        SELECT segmentId, organizationId, count() AS contributionCount
+        SELECT channel, organizationId, count() AS contributionCount
         FROM activityRelations_deduplicated_cleaned_bucket_union
         WHERE
             organizationId != ''
@@ -28,31 +37,31 @@ SQL >
             AND timestamp >= toStartOfDay(now() - INTERVAL 365 DAY)
             AND timestamp < toStartOfDay(now() + INTERVAL 1 DAY)
             AND channel NOT IN (SELECT channel FROM repos_to_channels_excluded)
-        GROUP BY segmentId, organizationId
+        GROUP BY channel, organizationId
     {% end %}
 
 NODE health_score_organization_dependency_pct
 SQL >
     %
     SELECT
-        segmentId,
+        channel,
         organizationId,
         contributionCount,
         (
-            contributionCount * 100.0 / SUM(contributionCount) OVER (PARTITION BY segmentId)
+            contributionCount * 100.0 / SUM(contributionCount) OVER (PARTITION BY channel)
         ) AS contributionPercentage
-    FROM health_score_organization_dependency_contribution_count
+    FROM repo_health_score_organization_dependency_count
     ORDER BY contributionPercentage DESC
 
 NODE health_score_organization_dependency_running
 SQL >
     %
     SELECT
-        segmentId,
+        channel,
         organizationId,
         contributionPercentage,
         SUM(contributionPercentage) OVER (
-            PARTITION BY segmentId ORDER BY contributionPercentage DESC, organizationId
+            PARTITION BY channel ORDER BY contributionPercentage DESC, organizationId
         ) AS contributionPercentageRunningTotal
     FROM health_score_organization_dependency_pct
 
@@ -60,20 +69,20 @@ NODE health_score_organization_dependency_score
 SQL >
     %
     SELECT
-        segmentId,
+        channel,
         count() AS organizationDependencyCount,
         round(sum(contributionPercentage)) AS organizationDependencyPercentage
     FROM health_score_organization_dependency_running
     WHERE
         contributionPercentageRunningTotal < 51
         OR (contributionPercentageRunningTotal - contributionPercentage < 51)
-    GROUP BY segmentId
+    GROUP BY channel
 
 NODE health_score_organization_dependency_benchmark
 SQL >
     %
     SELECT
-        segmentId,
+        channel,
         organizationDependencyCount,
         organizationDependencyPercentage,
         CASE
