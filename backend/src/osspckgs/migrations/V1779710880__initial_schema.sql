@@ -58,10 +58,12 @@ CREATE TABLE packages (
     latest_release_at timestamptz,
     dependent_packages_count int,
     dependent_repos_count int,
-    -- has_critical_vulnerability bool NOT NULL DEFAULT FALSE,
-    -- Deferred: semantics undecided between (a) any advisory with no fixed_version vs
-    -- (b) latest_version falls inside an affected semver range. Lateral join against
-    -- advisory_packages used in queries until this is resolved.
+    -- has_critical_vulnerability: TRUE iff latest_version is inside an active
+    -- affected range of a critical advisory (CVSS >= 7.0) OR a MAL-* malicious-
+    -- package advisory matches the package. Maintained by the deriveCriticalFlag
+    -- activity in packages_worker/src/osv/. See ADR-0001 §`has_critical_vulnerability`
+    -- semantics for the option-b + MAL- override rationale.
+    has_critical_vulnerability bool NOT NULL DEFAULT FALSE,
     criticality_score numeric(10, 4),
     -- is_critical and last_rank_pass_at are not in the original pckgs.md spec; added so
     -- the packages table can answer "is this package critical?" without joining packages_universe,
@@ -82,8 +84,12 @@ CREATE INDEX ON packages (ecosystem, name);
 
 CREATE INDEX ON packages USING gin (keywords);
 
--- INDEX on has_critical_vulnerability removed — column is commented out above.
--- Uncomment both when semantics are decided.
+-- Partial index on has_critical_vulnerability TRUE rows only — that's the bucket
+-- the security overlay query needs ("list all packages with a known critical
+-- vuln"). The FALSE rows dominate the table and don't need an index.
+CREATE INDEX ON packages (has_critical_vulnerability)
+WHERE
+    has_critical_vulnerability;
 
 CREATE INDEX ON packages (criticality_score DESC)
 WHERE
@@ -569,6 +575,15 @@ CREATE TABLE advisories (
     aliases text[], -- CVE-XXXX, GHSA-...
     severity text, -- 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL'
     cvss numeric(3, 1),
+    -- Provenance of the cvss value above. Lets downstream consumers distinguish
+    -- a real vendor-supplied vector from a synthesized qualitative fallback.
+    -- See ADR-0001 §CVSS scoring strategy. Allowed values:
+    --   'osv_cvss_v3'              numeric score from a CVSS_V3 vector
+    --   'osv_cvss_v4'              reserved; v4 numeric scoring deferred
+    --   'osv_qualitative_fallback' synthesized from database_specific.severity
+    --   'osv_malicious_package'    MAL-* id with no CVSS vector
+    -- Extensible to 'ghsa' | 'nvd' as additional sources come online.
+    cvss_source text,
     -- >= 7.0 intentional: treat HIGH + CRITICAL both as actionable
     is_critical bool GENERATED ALWAYS AS (cvss >= 7.0) STORED,
     summary text,
@@ -599,10 +614,27 @@ CREATE INDEX ON advisory_packages (package_id)
 WHERE
     package_id IS NOT NULL;
 
--- Version ranges affected by an advisory per package.
+-- Drives the resolveMissingPackageIds catch-up UPDATE in deriveCriticalFlag:
+-- the query filters WHERE package_id IS NULL and joins on (ecosystem,
+-- package_name). The non-partial (ecosystem, package_name) index above is
+-- usable here too (the planner just adds a Filter on package_id IS NULL), but
+-- as the table grows the vast majority of rows have package_id IS NOT NULL,
+-- so the non-partial scan ends up filtering out most of what it reads. This
+-- partial index only contains the still-unresolved rows, keeping it tiny
+-- regardless of total table size and making the daily catch-up O(unresolved)
+-- instead of O(total).
+CREATE INDEX ON advisory_packages (ecosystem, package_name)
+WHERE
+    package_id IS NULL;
+
+-- Version ranges affected by an advisory per package. Populated by the OSV
+-- ingest worker (packages_worker/src/osv) using introduced_version /
+-- fixed_version / last_affected. range_raw / unaffected_raw are reserved
+-- for the deps.dev BQ ingest worker (future): that worker writes the raw
+-- range strings without parsing into structured boundaries. The OSV upsert
+-- path only deletes rows where range_raw / unaffected_raw are both NULL,
+-- so deps.dev rows are not clobbered when OSV re-syncs.
 -- COALESCE prevents silent duplicates when introduced_version is NULL.
--- BQ-sourced rows populate range_raw / unaffected_raw only; introduced/fixed/last_affected
--- are populated by a future range-parsing workstream.
 CREATE TABLE advisory_affected_ranges (
     id bigserial PRIMARY KEY,
     advisory_package_id bigint NOT NULL REFERENCES advisory_packages (id),
@@ -613,7 +645,18 @@ CREATE TABLE advisory_affected_ranges (
     unaffected_raw text      -- raw UnaffectedVersions string from deps.dev BQ
 );
 
-CREATE UNIQUE INDEX ON advisory_affected_ranges (advisory_package_id, COALESCE(introduced_version, ''));
+-- Full-tuple uniqueness so two ranges sharing introduced_version but differing
+-- in fixed_version or last_affected (cross-distro patches, partial fixes in a
+-- single advisory) both survive insertion. The narrower (advisory_package_id,
+-- introduced_version) form silently collapsed those cases to one row, dropping
+-- the wider range and under-reporting vulnerable windows in the derive step.
+-- See ADR-0001 §`advisory_affected_ranges` uniqueness scope.
+CREATE UNIQUE INDEX ON advisory_affected_ranges (
+    advisory_package_id,
+    COALESCE(introduced_version, ''),
+    COALESCE(fixed_version, ''),
+    COALESCE(last_affected, '')
+);
 
 CREATE INDEX ON advisory_affected_ranges (advisory_package_id);
 
