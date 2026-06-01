@@ -795,6 +795,28 @@ PARTITION BY RANGE (end_date);
 CREATE INDEX ON downloads_last_30d (purl, end_date DESC);
 
 -- ============================================================
+-- AUDIT — per-purl field-change log
+--
+-- Append-only log of field-level changes. Each row records the set of
+-- 'table.column' tokens that were actually mutated for a given purl during one
+-- worker write pass. Rows with no real changes are not written (caller skips
+-- the insert when changed_fields is empty).
+-- ============================================================
+CREATE TABLE audit_field_changes (
+    id             bigserial PRIMARY KEY,
+    worker         text NOT NULL,
+    purl           text NOT NULL,
+    logged_at      timestamptz NOT NULL DEFAULT NOW(),
+    changed_fields text[] NOT NULL
+);
+
+CREATE INDEX ON audit_field_changes (purl, logged_at DESC);
+
+CREATE INDEX ON audit_field_changes (worker, logged_at DESC);
+
+CREATE INDEX ON audit_field_changes USING gin (changed_fields);
+
+-- ============================================================
 -- CRITICALITY RANKING FUNCTION
 -- ============================================================
 CREATE OR REPLACE FUNCTION rank_packages_universe(
