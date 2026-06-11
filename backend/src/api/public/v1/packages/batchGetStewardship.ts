@@ -7,6 +7,7 @@ import { getPackagesQx } from '@/db/packagesDb'
 import { ok } from '@/utils/api'
 import { validateOrThrow } from '@/utils/validation'
 
+import { normalizePurl } from './purl'
 import type { StewardshipSummary } from './types'
 
 const MAX_PURLS = 100
@@ -26,7 +27,9 @@ const bodySchema = z.object({
 
 export async function batchGetStewardship(req: Request, res: Response): Promise<void> {
   const { purls: rawPurls } = validateOrThrow(bodySchema, req.body)
-  const normalizedPurls = rawPurls.map((p) => p.replace(/@/g, '%40'))
+  // Normalize after parsing (not in the schema) so rawPurls keeps the client's
+  // original form — used as the response key so clients can look up their input.
+  const normalizedPurls = rawPurls.map(normalizePurl)
 
   const qx = await getPackagesQx()
   const rows = await getPackagesByStewardshipPurls(qx, normalizedPurls)
