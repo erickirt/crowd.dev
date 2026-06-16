@@ -54,6 +54,7 @@ export interface PackageListRow {
   name: string
   ecosystem: string
   criticalityScore: number | null
+  stewardshipId: string | null
   stewardshipStatus: string | null
   openVulns: number
   maintainerCount: number
@@ -226,6 +227,7 @@ export async function listPackagesForApi(
       p.name,
       p.ecosystem,
       p.impact AS "criticalityScore",
+      s.id::text AS "stewardshipId",
       s.status AS "stewardshipStatus",
       COALESCE(ap_counts.cnt, 0) AS "openVulns",
       pm_counts.cnt AS "maintainerCount",
@@ -273,8 +275,11 @@ export interface PackageDetailRow {
   declaredRepositoryUrl: string | null
   repositoryUrl: string | null
   hasCriticalVulnerability: boolean
+  stewardshipId: string | null
   stewardshipStatus: string | null
   stewardshipLastStatusAt: Date | null
+  stewardshipResolutionPath: string | null
+  stewardshipStatusNote: string | null
   // from package_repos + repos
   repoUrl: string | null
   repoMappingConfidence: number | null
@@ -315,8 +320,11 @@ export async function getPackageDetailByPurl(
       p.declared_repository_url AS "declaredRepositoryUrl",
       p.repository_url AS "repositoryUrl",
       p.has_critical_vulnerability AS "hasCriticalVulnerability",
+      s.id::text AS "stewardshipId",
       s.status AS "stewardshipStatus",
       s.last_status_at AS "stewardshipLastStatusAt",
+      s.resolution_path AS "stewardshipResolutionPath",
+      s.status_note AS "stewardshipStatusNote",
       -- best repo link (highest confidence, prefer declared)
       r.url AS "repoUrl",
       pr.confidence AS "repoMappingConfidence",
