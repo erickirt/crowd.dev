@@ -298,12 +298,11 @@ class MemberRepository {
     const HIGH_CONFIDENCE_LOWER_BOUND = 0.9
     const MEDIUM_CONFIDENCE_LOWER_BOUND = 0.7
 
-    const qx = SequelizeRepository.getQueryExecutor(options)
-    const currentSegments = SequelizeRepository.getSegmentIds(options)
+    // Member segments are aggregated at each hierarchy level (group -> project -> subproject).
+    // Match the selected segment ID directly; do not expand to leaf subprojects.
+    const segmentIds = SequelizeRepository.getSegmentIds(options)
 
-    const subprojectIds = await getSegmentSubprojectIds(qx, currentSegments)
-
-    if (subprojectIds.length === 0) {
+    if (segmentIds.length === 0) {
       return args.countOnly
         ? { count: '0' }
         : {
@@ -364,7 +363,7 @@ class MemberRepository {
         similarityFilter,
         displayNameFilter,
         {
-          segmentIds: subprojectIds,
+          segmentIds,
           displayName: args?.filter?.displayName ? `${args.filter.displayName}%` : undefined,
           memberId: args?.filter?.memberId,
         },
@@ -406,7 +405,7 @@ class MemberRepository {
       `,
       {
         replacements: {
-          segmentIds: subprojectIds,
+          segmentIds,
           limit: args.limit,
           offset: args.offset,
           displayName: args?.filter?.displayName ? `${args.filter.displayName}%` : undefined,
@@ -512,7 +511,7 @@ class MemberRepository {
         similarityFilter,
         displayNameFilter,
         {
-          segmentIds: subprojectIds,
+          segmentIds,
           memberId: args?.filter?.memberId,
           displayName: args?.filter?.displayName ? `${args.filter.displayName}%` : undefined,
         },

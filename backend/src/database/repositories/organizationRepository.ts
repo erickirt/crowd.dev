@@ -849,10 +849,9 @@ class OrganizationRepository {
     const HIGH_CONFIDENCE_LOWER_BOUND = 0.9
     const MEDIUM_CONFIDENCE_LOWER_BOUND = 0.7
 
-    const qx = SequelizeRepository.getQueryExecutor(options)
-    const currentSegments = SequelizeRepository.getSegmentIds(options)
-
-    const segmentIds = await getSegmentSubprojectIds(qx, currentSegments)
+    // Organization segments are aggregated at each hierarchy level (group -> project -> subproject).
+    // Match the selected segment ID(s) directly; do not expand to leaf subprojects.
+    const segmentIds = SequelizeRepository.getSegmentIds(options)
 
     let similarityFilter = ''
     const similarityConditions = []
