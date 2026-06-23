@@ -1,5 +1,11 @@
 import { QueryExecutor } from '../queryExecutor'
 
+import {
+  SEVERITY_RANK_EXPR,
+  STEWARD_DISPLAY_NAME_METADATA,
+  STEWARD_MENTIONED_JOIN,
+} from './sqlFragments'
+
 export interface PackageMetrics {
   totalPackages: number
   criticalPackages: number
@@ -167,16 +173,9 @@ export interface ListPackagesOptions {
   sortDir: 'asc' | 'desc'
 }
 
-const STALE_MONTHS = 18
+export { SEVERITY_RANK_EXPR } from './sqlFragments'
 
-// Severity stored as uppercase in advisories table.
-// Ranks: CRITICAL=4, HIGH=3, MEDIUM=2, LOW=1
-export const SEVERITY_RANK_EXPR = `MAX(CASE a.severity
-    WHEN 'CRITICAL' THEN 4
-    WHEN 'HIGH'     THEN 3
-    WHEN 'MEDIUM'   THEN 2
-    WHEN 'LOW'      THEN 1
-    ELSE 0 END)::int`
+const STALE_MONTHS = 18
 
 export interface PackageStatusCounts {
   all: number
@@ -512,8 +511,10 @@ export async function listPackagesForApi(
     opts.includeLastActivity === true
       ? `
     LEFT JOIN LATERAL (
-      SELECT sa.activity_type, sa.content, sa.metadata, sa.created_at
+      SELECT sa.activity_type, sa.content, sa.created_at,
+        ${STEWARD_DISPLAY_NAME_METADATA} AS metadata
       FROM stewardship_activity sa
+      ${STEWARD_MENTIONED_JOIN}
       WHERE sa.stewardship_id = s.id
       ORDER BY sa.created_at DESC
       LIMIT 1
@@ -545,7 +546,7 @@ export async function listPackagesForApi(
       r_sc.scorecard_score AS "scorecardScore",
       p.latest_release_at AS "latestReleaseAt",
       ${opts.includeLastActivity === true ? `last_act.activity_type AS "lastActivityType", last_act.content AS "lastActivityContent", last_act.metadata AS "lastActivityMetadata", last_act.created_at AS "lastActivityAt",` : ''}
-      ${opts.includeStewards === true ? "COALESCE(ss_agg.stewards, '[]'::json) AS stewards," : ''}
+      ${opts.includeStewards === true ? 'ss_agg.stewards AS stewards,' : ''}
       COUNT(*) OVER() AS total
     FROM packages p
     ${laterals}
