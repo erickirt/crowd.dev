@@ -2,7 +2,9 @@ import type { PackageDbRow } from '@crowd/types'
 
 import { QueryExecutor } from '../queryExecutor'
 
+import { type AdvisoryAffectedRange, resolveAdvisory } from './advisoryResolution'
 import {
+  ADVISORY_RESOLUTION_EXPR,
   BEST_REPO_LINK_JOIN,
   DOWNLOADS_LAST_30D_SUBQUERY,
   MAINTAINER_COUNT_SUBQUERY,
@@ -968,22 +970,7 @@ export async function getAdvisoriesByPackageId(
         a.osv_id AS "osvId",
         LOWER(a.severity) AS severity,
         a.is_critical AS "isCritical",
-        CASE
-          WHEN p.latest_version IS NULL THEN NULL
-          WHEN COUNT(ar.id) = 0 THEN NULL
-          -- TODO: text comparison is lexicographic, not semver — '1.9.0' >= '1.10.0' is TRUE here.
-          -- Replace with a proper semver comparison function when one is available in the DB.
-          WHEN BOOL_AND(
-            CASE
-              WHEN ar.fixed_version IS NULL AND ar.last_affected IS NULL THEN FALSE
-              WHEN ar.fixed_version IS NOT NULL AND p.latest_version >= ar.fixed_version THEN TRUE
-              WHEN ar.fixed_version IS NOT NULL THEN FALSE
-              WHEN ar.last_affected IS NOT NULL AND p.latest_version > ar.last_affected THEN TRUE
-              ELSE FALSE
-            END
-          ) THEN 'patched'
-          ELSE 'open'
-        END AS resolution
+        ${ADVISORY_RESOLUTION_EXPR} AS resolution
       FROM advisory_packages ap
       JOIN advisories a ON a.id = ap.advisory_id
       LEFT JOIN advisory_affected_ranges ar ON ar.advisory_package_id = ap.id
@@ -1036,4 +1023,82 @@ export async function getAdvisoriesByPackageId(
   )) as { total: string }
 
   return { rows, total: Number(countResult.total) }
+}
+
+// One row per (package, advisory) for the akrites-external Advisories contract,
+// keyed by purl and batched across many packages in a single query. Packages that
+// exist but have zero advisories still yield exactly one row, with osvId null — this
+// is how the caller distinguishes "package not found" (no row at all) from "found, no
+// advisories". Unlike the internal getAdvisoriesByPackageId, `resolution` is computed
+// in TypeScript (resolveAdvisory) from the affected ranges rather than via the
+// lexicographic SQL expression — see advisoryResolution.ts for why.
+export interface AkritesExternalAdvisoryRow {
+  purl: string
+  // null only on the sentinel row emitted for a found package with no advisories.
+  osvId: string | null
+  // LOWER(a.severity); null when the advisory has no recorded severity.
+  severity: string | null
+  resolution: 'open' | 'patched' | null
+  // a.is_critical is GENERATED AS (cvss >= 7.0); null when cvss is unknown.
+  isCritical: boolean | null
+}
+
+interface AdvisoryRangesRow {
+  purl: string
+  osvId: string | null
+  severity: string | null
+  isCritical: boolean | null
+  latestVersion: string | null
+  // jsonb, parsed by the pg driver into an array of range objects (empty on the sentinel row).
+  ranges: AdvisoryAffectedRange[]
+}
+
+export async function getAdvisoriesByPurls(
+  qx: QueryExecutor,
+  purls: string[],
+): Promise<AkritesExternalAdvisoryRow[]> {
+  if (purls.length === 0) return []
+  const rows: AdvisoryRangesRow[] = await qx.select(
+    `
+    SELECT
+      p.purl,
+      p.latest_version  AS "latestVersion",
+      a.osv_id          AS "osvId",
+      LOWER(a.severity) AS severity,
+      a.is_critical     AS "isCritical",
+      COALESCE(
+        JSONB_AGG(
+          JSONB_BUILD_OBJECT(
+            'introduced', ar.introduced_version,
+            'fixed', ar.fixed_version,
+            'lastAffected', ar.last_affected,
+            'rangeRaw', ar.range_raw,
+            'unaffectedRaw', ar.unaffected_raw
+          )
+        ) FILTER (WHERE ar.id IS NOT NULL),
+        '[]'::jsonb
+      ) AS ranges
+    FROM packages p
+    LEFT JOIN advisory_packages ap ON ap.package_id = p.id
+    LEFT JOIN advisories a ON a.id = ap.advisory_id
+    LEFT JOIN advisory_affected_ranges ar ON ar.advisory_package_id = ap.id
+    WHERE p.purl = ANY($(purls))
+    GROUP BY p.purl, p.latest_version, a.osv_id, a.severity, a.is_critical
+    ORDER BY
+      p.purl,
+      CASE LOWER(a.severity)
+        WHEN 'critical' THEN 1 WHEN 'high' THEN 2 WHEN 'moderate' THEN 3 WHEN 'medium' THEN 3 WHEN 'low' THEN 4 ELSE 5
+      END,
+      a.osv_id
+    `,
+    { purls },
+  )
+
+  return rows.map((r) => ({
+    purl: r.purl,
+    osvId: r.osvId,
+    severity: r.severity,
+    resolution: r.osvId === null ? null : resolveAdvisory(r.latestVersion, r.ranges),
+    isCritical: r.isCritical,
+  }))
 }
