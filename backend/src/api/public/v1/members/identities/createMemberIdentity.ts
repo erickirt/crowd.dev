@@ -13,9 +13,9 @@ import {
 } from '@crowd/data-access-layer'
 import { IMemberIdentity, MemberIdentityType } from '@crowd/types'
 
+import { rethrowIdentityConflict } from '@/api/public/alerts/identityConflict'
 import { optionsQx } from '@/database/sequelizeQueryExecutor'
 import { created, ok } from '@/utils/api'
-import { rethrowDbConflict } from '@/utils/err'
 import { validateOrThrow } from '@/utils/validation'
 
 const paramsSchema = z.object({
@@ -101,8 +101,12 @@ export async function createMemberIdentity(req: Request, res: Response): Promise
             }
           }
         } catch (error) {
-          const ctx = { platform: data.platform, value: data.value, type: data.type }
-          rethrowDbConflict(error, ctx)
+          rethrowIdentityConflict(req, error, {
+            memberId,
+            platform: data.platform,
+            value: data.value,
+            type: data.type,
+          })
         }
 
         await touchMemberUpdatedAt(tx, memberId)
