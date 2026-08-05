@@ -1,8 +1,5 @@
-// The blast-radius submit endpoint accepts either a bare npm package name
-// ("lodash", "@babel/core") or a full purl ("pkg:npm/lodash", "pkg:npm/%40babel/core@4.17.21")
-// for the `package` field — see blastRadiusJobRequestSchema. OSV affected-package entries and
-// the npm registry only ever use bare names, so a purl must be reduced to that form before
-// it's compared against them (raw string equality otherwise never matches a purl input).
+// Accepts a bare npm name or a full purl (see blastRadiusJobRequestSchema) and reduces
+// it to the bare form OSV/the npm registry compare against.
 export function toBareNpmName(input: string): string {
   let name = input.trim()
 
@@ -42,6 +39,33 @@ export function toBareGoModule(input: string): string {
   name = name.replace(/@[^/@]+$/, '')
 
   return name
+}
+
+// Same normalization as toBareGoModule, but for Cargo: crates.io purls spell the
+// ecosystem 'cargo' and crate names never contain '@' themselves either.
+export function toBareCargoName(input: string): string {
+  let name = input.trim()
+
+  const q = name.indexOf('?')
+  const h = name.indexOf('#')
+  const cut = q === -1 ? h : h === -1 ? q : Math.min(q, h)
+  if (cut !== -1) name = name.slice(0, cut)
+
+  name = decodeURIComponent(name)
+
+  if (name.startsWith('pkg:cargo/')) {
+    name = name.slice('pkg:cargo/'.length)
+  }
+
+  name = name.replace(/@[^/@]+$/, '')
+
+  return name
+}
+
+// packages/purl rows store cargo names '_'-normalized (see cargo/loadDump.ts) while
+// OSV/crates.io use '-'. Apply ONLY at the packages-table lookup boundary.
+export function toDbCargoName(name: string): string {
+  return name.toLowerCase().replace(/-/g, '_')
 }
 
 // Maven has no single "bare name" — accepts either the "groupId:artifactId" coordinate
