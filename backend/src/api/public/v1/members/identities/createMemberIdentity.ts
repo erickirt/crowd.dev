@@ -2,12 +2,13 @@ import type { Request, Response } from 'express'
 import { z } from 'zod'
 
 import { captureApiChange, memberEditIdentitiesAction } from '@crowd/audit-logs'
-import { NotFoundError } from '@crowd/common'
+import { ConflictError, NotFoundError, normalizeMemberIdentityValue } from '@crowd/common'
 import {
   MemberField,
   findMemberById,
   findMemberIdByVerifiedIdentity,
   findMemberIdentitiesByValue,
+  findMemberIdentityConflict,
   insertMemberIdentities,
   touchMemberUpdatedAt,
   updateMemberIdentity,
@@ -39,7 +40,11 @@ const bodySchema = z
 
 export async function createMemberIdentity(req: Request, res: Response): Promise<void> {
   const { memberId } = validateOrThrow(paramsSchema, req.params)
-  const data = validateOrThrow(bodySchema, req.body)
+  const raw = validateOrThrow(bodySchema, req.body)
+  const data = {
+    ...raw,
+    value: normalizeMemberIdentityValue(raw.value),
+  }
 
   const qx = optionsQx(req)
   const member = await findMemberById(qx, memberId, [MemberField.ID])
@@ -47,7 +52,14 @@ export async function createMemberIdentity(req: Request, res: Response): Promise
     throw new NotFoundError('Member not found')
   }
 
-  let result!: IMemberIdentity
+  const conflictContext = {
+    memberId,
+    platform: data.platform,
+    value: data.value,
+    type: data.type,
+  }
+
+  let identity!: IMemberIdentity
   let alreadyExisted = false
 
   await captureApiChange(
@@ -55,18 +67,37 @@ export async function createMemberIdentity(req: Request, res: Response): Promise
     memberEditIdentitiesAction(memberId, async (captureOldState, captureNewState) => {
       captureOldState({})
 
-      await qx.tx(async (tx) => {
+      const outcome = await qx.tx(async (tx) => {
         const existing = await findMemberIdentitiesByValue(tx, memberId, data.value, {
           type: data.type,
         })
-        const exactMatch = existing.find((i) => i.platform === data.platform)
+
+        const exactMatch = existing.find((row) => row.platform === data.platform)
+
+        let result = exactMatch
+        const existed = Boolean(exactMatch)
+
+        // Unverified identities aren't unique in the db, so the same handle or
+        // email can sit on several members. Reject it here if someone else has it.
+        if (!result && !data.verified) {
+          const conflict = await findMemberIdentityConflict(tx, {
+            value: data.value,
+            platform: data.platform,
+            type: data.type,
+            excludeMemberId: memberId,
+          })
+
+          if (conflict) {
+            throw new ConflictError('Identity already exists on another member', {
+              ...conflictContext,
+              conflictMemberId: conflict.memberId,
+            })
+          }
+        }
 
         try {
-          if (exactMatch) {
-            alreadyExisted = true
-            result = exactMatch
-          } else {
-            const [created] = await insertMemberIdentities(
+          if (!result) {
+            const [inserted] = await insertMemberIdentities(
               tx,
               [
                 {
@@ -82,23 +113,26 @@ export async function createMemberIdentity(req: Request, res: Response): Promise
               true,
               true,
             )
-            result = created
+
+            result = inserted
           }
 
           // A verified identity confirms the same value for this member, so keep same-value
           // identities in sync instead of leaving stale unverified duplicates behind.
           if (data.verified && existing.length > 0) {
-            const updatedResults: IMemberIdentity[] = []
-            for (const identity of existing) {
-              const updated = await updateMemberIdentity(tx, memberId, identity.id, {
-                verified: true,
-                verifiedBy: data.verifiedBy,
-              })
-              if (updated) updatedResults.push(updated)
-            }
+            const updatedRows = await Promise.all(
+              existing.map((row) =>
+                updateMemberIdentity(tx, memberId, row.id, {
+                  verified: true,
+                  verifiedBy: data.verifiedBy,
+                }),
+              ),
+            )
 
-            if (alreadyExisted) {
-              result = updatedResults.find((r) => r.id === exactMatch.id) ?? result
+            const updatedExact = updatedRows.find((row) => row?.id === exactMatch?.id)
+
+            if (updatedExact) {
+              result = updatedExact
             }
           }
         } catch (error) {
@@ -111,11 +145,8 @@ export async function createMemberIdentity(req: Request, res: Response): Promise
             )
 
             rethrowDbConflict(error, {
-              memberId,
+              ...conflictContext,
               ...(conflictMemberId ? { conflictMemberId } : {}),
-              platform: data.platform,
-              value: data.value,
-              type: data.type,
             })
           }
 
@@ -123,22 +154,27 @@ export async function createMemberIdentity(req: Request, res: Response): Promise
         }
 
         await touchMemberUpdatedAt(tx, memberId)
+
+        return { identity: result, alreadyExisted: existed }
       })
 
-      captureNewState(result)
+      identity = outcome.identity
+      alreadyExisted = outcome.alreadyExisted
+
+      captureNewState(identity)
     }),
   )
 
   const response = {
-    id: result.id,
-    value: result.value,
-    platform: result.platform,
-    type: result.type,
-    verified: result.verified,
-    verifiedBy: result.verifiedBy ?? null,
-    source: result.source ?? null,
-    createdAt: result.createdAt,
-    updatedAt: result.updatedAt,
+    id: identity.id,
+    value: identity.value,
+    platform: identity.platform,
+    type: identity.type,
+    verified: identity.verified,
+    verifiedBy: identity.verifiedBy ?? null,
+    source: identity.source ?? null,
+    createdAt: identity.createdAt,
+    updatedAt: identity.updatedAt,
   }
 
   if (alreadyExisted) {
