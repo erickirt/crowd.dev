@@ -1752,6 +1752,9 @@ importers:
       '@crowd/temporal':
         specifier: workspace:*
         version: link:../../libs/temporal
+      '@crowd/types':
+        specifier: workspace:*
+        version: link:../../libs/types
       '@temporalio/client':
         specifier: 'catalog:'
         version: 1.17.2
