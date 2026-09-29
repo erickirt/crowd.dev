@@ -1,3 +1,4 @@
+import { registrableDomain } from '@crowd/common'
 import type { IDocCandidate } from '@crowd/data-access-layer'
 
 import { domainOf, normalizedDomain } from './http'
@@ -46,6 +47,18 @@ function sharedKey(url: string): string | null {
   return domain ? `${domain}${pathnameOf(url).replace(/\/+$/, '')}` : null
 }
 
+export function isClaimedUrl(url: string, claimedUrls: Iterable<string>): boolean {
+  const key = sharedKey(url)
+  return !!key && [...claimedUrls].some((claimed) => sharedKey(claimed) === key)
+}
+
+const isDocsHost = (url: string): boolean => (domainOf(url) ?? '').startsWith('docs.')
+
+const isBareRoot = (url: string): boolean => {
+  const domain = normalizedDomain(url)
+  return !!domain && domain === registrableDomain(url) && pathnameOf(url).replace(/\/+$/, '') === ''
+}
+
 const isGithubRepoPath = (host: string, pathname: string): boolean =>
   host !== 'docs.github.com' && /^\/[^/]+\/[^/]+/.test(pathname)
 
@@ -85,7 +98,11 @@ export function candidateHasDocsSignal(c: IDocCandidate): boolean {
   return EXPLICIT_DOCS_PROBE_METHODS.has(c.method) || hasDocsSignal(host, pathnameOf(c.url))
 }
 
-function isOnProjectDomain(url: string, projectDomain: string): boolean {
+// Real evidence for a docs URL: not a SERP guess, not the bare repo page or GitHub's own hosts.
+export const isOrganicCandidate = (c: IDocCandidate): boolean =>
+  c.method !== 'serp' && c.method !== 'repo-url' && !GITHUB_SHARED_HOSTS.has(domainOf(c.url) ?? '')
+
+export function isOnProjectDomain(url: string, projectDomain: string): boolean {
   const domain = normalizedDomain(url)
   return domain === projectDomain || (domain?.endsWith(`.${projectDomain}`) ?? false)
 }
@@ -106,10 +123,14 @@ export function rankCandidates(
   projectNameHint: string | null = null,
   sharedDocsUrls: ReadonlySet<string> = new Set(),
 ): IDocCandidate | null {
-  const live = candidates.filter((c) => c.livenessOk)
-  if (live.length === 0) {
+  const allLive = candidates.filter((c) => c.livenessOk)
+  if (allLive.length === 0) {
     return null
   }
+  // SERP is a guess: it may only win when no organic live candidate exists.
+  const live = allLive.some(isOrganicCandidate)
+    ? allLive.filter((c) => c.method !== 'serp')
+    : allLive
 
   // Below this length a token is too common/generic (e.g. a short or generic org name) to
   // safely narrow the pool by substring match.
@@ -180,5 +201,21 @@ export function rankCandidates(
   })
 
   scored.sort((a, b) => b.score - a.score)
-  return scored[0].candidate
+  const best = scored[0].candidate
+
+  // A live docs.<domain> beats the bare marketing root of the same domain, whatever its score.
+  if (!isDocsHost(best.url) && isBareRoot(best.url)) {
+    const root = registrableDomain(best.url)
+    const docsHost = scored.find(
+      ({ candidate: c }) =>
+        isDocsHost(c.url) &&
+        !isShared(c) &&
+        !GITHUB_SHARED_HOSTS.has(domainOf(c.url) ?? '') &&
+        registrableDomain(c.url) === root,
+    )
+    if (docsHost) {
+      return docsHost.candidate
+    }
+  }
+  return best
 }

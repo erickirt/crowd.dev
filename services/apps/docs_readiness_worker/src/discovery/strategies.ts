@@ -22,12 +22,15 @@ import {
   normalizeUrl,
   normalizedDomain,
 } from './http'
+import { isRelevantSerpResult, projectTokens } from './relevance'
 
 export interface IDiscoveryContext {
   name: string
   slug: string
   website: string | null
   websiteShared: boolean
+  // Website shared only with twins or a family of this project, so docs URLs on it are legitimately shared.
+  websiteSharedByFamily?: boolean
   findSharedDocsUrls?: (hosts: string[]) => Promise<string[]>
   repos: IRepoRef[]
   githubToken: string | null
@@ -510,9 +513,14 @@ export const serpStrategy: DiscoveryStrategy = async (ctx) => {
       organic_results?: { link?: string; title?: string }[]
     }
     const results = body.organic_results ?? []
+    const tokens = projectTokens({
+      name: ctx.name,
+      slug: ctx.slug,
+      repoUrl: primaryRepo(ctx.repos, { slug: ctx.slug, name: ctx.name }),
+    })
 
     const kept = results.filter((result) => {
-      if (!result.link) {
+      if (!result.link || !isRelevantSerpResult(result.link, tokens)) {
         return false
       }
       const host = domainOf(result.link)

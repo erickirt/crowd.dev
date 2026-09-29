@@ -1,7 +1,15 @@
 import type { IDocCandidate } from '@crowd/data-access-layer'
 
+import { cutToDocsRoot } from './docsRoot'
 import { isGithubWebsite, normalizedDomain } from './http'
-import { candidateHasDocsSignal, methodPriority, rankCandidates, repoNameAnchor } from './rank'
+import {
+  isClaimedUrl,
+  isOnProjectDomain,
+  isOrganicCandidate,
+  methodPriority,
+  rankCandidates,
+  repoNameAnchor,
+} from './rank'
 import { type IDiscoveryContext, STRATEGIES, serpStrategy } from './strategies'
 
 export interface IDiscoverDocsResult {
@@ -45,7 +53,8 @@ async function runStrategies(
 export async function discoverDocs(ctx: IDiscoveryContext): Promise<IDiscoverDocsResult> {
   const baseCandidates = dedupeByUrl(await runStrategies(STRATEGIES, ctx))
 
-  const hasLiveCandidate = baseCandidates.some((c) => c.livenessOk && candidateHasDocsSignal(c))
+  // A homepage is enough: SERP only runs when nothing but the bare GitHub repo (repo-url) is live.
+  const hasLiveCandidate = baseCandidates.some((c) => c.livenessOk && isOrganicCandidate(c))
   const allCandidates =
     !hasLiveCandidate && ctx.serpApiKey
       ? dedupeByUrl([...baseCandidates, ...(await runStrategies([serpStrategy], ctx))])
@@ -65,8 +74,13 @@ export async function discoverDocs(ctx: IDiscoveryContext): Promise<IDiscoverDoc
         .filter((host): host is string => !!host),
     ),
   ]
-  const sharedDocsUrls =
+  const claimedDocsUrls =
     ctx.findSharedDocsUrls && liveHosts.length > 0 ? await ctx.findSharedDocsUrls(liveHosts) : []
+  // Twins and family legitimately share their own site's docs, so a claim there is not a penalty.
+  const familyDomain = ctx.websiteSharedByFamily ? projectDomain : null
+  const sharedDocsUrls = familyDomain
+    ? claimedDocsUrls.filter((url) => !isOnProjectDomain(url, familyDomain))
+    : claimedDocsUrls
   const winner = rankCandidates(
     allCandidates,
     projectDomain,
@@ -74,8 +88,13 @@ export async function discoverDocs(ctx: IDiscoveryContext): Promise<IDiscoverDoc
     new Set(sharedDocsUrls),
   )
 
+  // A cut root another project already claims would bypass the shared-URL penalty.
+  const cut = winner ? await cutToDocsRoot(winner.url) : null
+  const docsUrl =
+    winner && cut && cut !== winner.url && isClaimedUrl(cut, sharedDocsUrls) ? winner.url : cut
+
   return {
-    docsUrl: winner?.url ?? null,
+    docsUrl,
     discoveryMethod: winner?.method ?? null,
     confidence: winner?.confidence ?? null,
     allCandidates,
