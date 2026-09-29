@@ -1,4 +1,4 @@
-import { canonicalizeGithubRepoUrl } from '@crowd/common'
+import { canonicalizeGithubRepoUrl, registrableDomain } from '@crowd/common'
 import type {
   DocDiscoveryConfidence,
   DocDiscoveryMethod,
@@ -55,6 +55,67 @@ export const DOCS_KEYWORDS =
 
 const BADGE_HOSTS = ['shields.io', 'img.shields.io', 'badge.fury.io']
 
+const README_EXCLUDED_HOSTS = [
+  ...BADGE_HOSTS,
+  'github.com',
+  'gitter.im',
+  'discord.gg',
+  'twitter.com',
+  'x.com',
+  'slack.com',
+  'youtube.com',
+  'youtu.be',
+  'githubusercontent.com',
+  'githubassets.com',
+  'docs.google.com',
+  'drive.google.com',
+]
+
+const EXCLUDED_PATH_SEGMENT =
+  /^(contribut\w*|code[-_]of[-_]conduct|security|issues?|bugs?|report|reporting[-_]bugs?|changelog|licen[sc]e)([-_.]|$)/i
+
+function isReadmeExcludedHost(host: string | null): boolean {
+  return (
+    !host ||
+    README_EXCLUDED_HOSTS.some((excluded) => host === excluded || host.endsWith(`.${excluded}`))
+  )
+}
+
+function pathSegments(url: string): string[] {
+  return new URL(url).pathname.split('/').filter(Boolean)
+}
+
+function collapseOwnDomainLink(url: string): string {
+  const parsed = new URL(url)
+  const segments = pathSegments(url)
+  if (segments.length < 1 || parsed.hostname.endsWith('.github.io')) {
+    return url
+  }
+  const docsIndex = segments.findIndex((segment) => DOCS_KEYWORDS.test(segment))
+  const kept = docsIndex === -1 ? [] : segments.slice(0, docsIndex + 1)
+  if (kept.length === segments.length) {
+    return url
+  }
+  parsed.search = ''
+  parsed.pathname = `/${kept.join('/')}`
+  return normalizeUrl(parsed.toString()) ?? url
+}
+
+const GENERIC_SUBDOMAINS = new Set(['www', 'wiki', 'web'])
+
+// Roots whose subdomains are unrelated projects (celf lives on wiki.linuxfoundation.org).
+const UMBRELLA_ROOTS = new Set(['linuxfoundation.org'])
+
+function docsBaseDomain(website: string): string | null {
+  const host = normalizedDomain(website)
+  const root = registrableDomain(website)
+  if (!host || !root || host === root || UMBRELLA_ROOTS.has(root)) {
+    return host
+  }
+  const subdomain = host.slice(0, -root.length - 1)
+  return subdomain.split('.').every((label) => GENERIC_SUBDOMAINS.has(label)) ? root : host
+}
+
 function candidate(url: string, method: NonOverrideMethod, livenessOk: boolean): IDocCandidate {
   return { url, method, confidence: STRATEGY_CONFIDENCE[method], livenessOk }
 }
@@ -76,6 +137,31 @@ const usableWebsite = (ctx: IDiscoveryContext): string | null =>
 
 const hasPath = (url: string): boolean => new URL(url).pathname !== '/'
 
+const PACKAGE_REGISTRIES = [
+  'npmjs.com',
+  'pypi.org',
+  'crates.io',
+  'rubygems.org',
+  'pkg.go.dev',
+  'hub.docker.com',
+  'packagist.org',
+  'nuget.org',
+]
+
+// A path homepage (npmjs.com/package/x) or a shared host does not make the whole domain its own.
+function usableHomepage(ctx: IDiscoveryContext, homepage: string | null): string | null {
+  const url = homepage ? normalizeUrl(homepage) : null
+  const host = url ? normalizedDomain(url) : null
+  if (!url || !host || isGithubWebsite(url) || hasPath(url)) {
+    return null
+  }
+  if (PACKAGE_REGISTRIES.some((registry) => host === registry || host.endsWith(`.${registry}`))) {
+    return null
+  }
+  const websiteBase = ctx.websiteShared && ctx.website ? docsBaseDomain(ctx.website) : null
+  return websiteBase !== null && websiteBase === docsBaseDomain(url) ? null : url
+}
+
 const isLlmsTxtBody = (body: string | null): body is string =>
   !!body && body.length > 50 && !/^\s*</.test(body)
 
@@ -91,7 +177,8 @@ export const llmsTxtProbe = async (
   try {
     const normalized = normalizeUrl(website)
     const domain = normalizedDomain(website)
-    if (!normalized || !domain) {
+    const docsDomain = docsBaseDomain(website)
+    if (!normalized || !domain || !docsDomain) {
       return []
     }
 
@@ -104,12 +191,12 @@ export const llmsTxtProbe = async (
     const bases = [
       ...new Set([
         ...(parsed.pathname === '/' ? [] : [websiteBase]),
-        ...(pathScopedOnly ? [] : [`https://docs.${domain}`, rootBase]),
+        ...(pathScopedOnly ? [] : [`https://docs.${docsDomain}`, rootBase]),
       ]),
     ]
 
     for (const base of bases) {
-      if (isLlmsTxtBody(await fetchText(`${base}/llms.txt`, 5_000))) {
+      if (isLlmsTxtBody(await fetchText(`${base}/llms.txt`, 5_000, true))) {
         return [candidate(base, 'llms-txt-probe', true)]
       }
     }
@@ -126,7 +213,11 @@ export const docsSubdomain: DiscoveryStrategy = async (ctx) => {
   }
 
   try {
-    const url = `https://docs.${normalizedDomain(website)}`
+    const domain = docsBaseDomain(website)
+    if (!domain) {
+      return []
+    }
+    const url = `https://docs.${domain}`
     return (await isLiveDocs(url)) ? [candidate(url, 'docs-subdomain', true)] : []
   } catch {
     return []
@@ -215,32 +306,96 @@ export const readmeScrape: DiscoveryStrategy = async (ctx) => {
       return []
     }
 
-    const links = new Map<string, string>()
-    for (const match of readme.matchAll(/\[([^\]]*)\]\((https?:\/\/[^)\s]+)\)/g)) {
-      links.set(match[2], match[1])
-    }
-    for (const match of readme.matchAll(/href="(https?:\/\/[^"]+)"/g)) {
-      if (!links.has(match[1])) {
-        links.set(match[1], '')
+    const links = new Map<string, { url: string; text: string }>()
+    const addLink = (raw: string, text: string) => {
+      const key = normalizeUrl(raw)
+      if (!key) {
+        return
+      }
+      const known = links.get(key)
+      if (!known || (!DOCS_KEYWORDS.test(known.text) && DOCS_KEYWORDS.test(text))) {
+        links.set(key, { url: raw.replace(/#.*$/, ''), text })
       }
     }
+    for (const match of readme.matchAll(/\[([^\]]*)\]\((https?:\/\/[^)\s]+)\)/g)) {
+      addLink(match[2], match[1])
+    }
+    for (const match of readme.matchAll(/href="(https?:\/\/[^"]+)"/g)) {
+      addLink(match[1], '')
+    }
 
-    const filtered: string[] = []
-    for (const [url, text] of links) {
+    const homepage = await getRepoHomepage(parsed.owner, parsed.repo, ctx.githubToken)
+    const ownBases = [usableWebsite(ctx), usableHomepage(ctx, homepage)].flatMap((site) => {
+      const base = site ? docsBaseDomain(site) : null
+      return base ? [base] : []
+    })
+    const ownerPages = `${parsed.owner.toLowerCase()}.github.io`
+    const rank = (url: string): number => {
+      const host = normalizedDomain(url)
+      if (host !== null && ownBases.some((base) => host === base || host.endsWith(`.${base}`))) {
+        return 0
+      }
+      return registrableDomain(url) === ownerPages ? 1 : 2
+    }
+
+    const filtered: { url: string; fallback?: string }[] = []
+    for (const { url, text } of links.values()) {
       if (!DOCS_KEYWORDS.test(text) && !DOCS_KEYWORDS.test(url)) {
         continue
       }
-      if (isBadgeOrGithubHost(domainOf(url))) {
+      const foreign = rank(url) === 2
+      if (foreign && !DOCS_KEYWORDS.test(text) && !DOCS_KEYWORDS.test(domainOf(url) ?? '')) {
         continue
       }
-      filtered.push(url)
+      if (isReadmeExcludedHost(domainOf(url))) {
+        continue
+      }
+      if (pathSegments(url).some((segment) => EXCLUDED_PATH_SEGMENT.test(segment))) {
+        continue
+      }
+      const collapsed = rank(url) === 0 ? collapseOwnDomainLink(url) : url
+      filtered.push({ url: collapsed, fallback: collapsed === url ? undefined : url })
     }
 
-    const candidates: IDocCandidate[] = []
-    for (const url of filtered.slice(0, 5)) {
-      if (await isLiveDocs(url)) {
-        candidates.push(candidate(url, 'readme-scrape', true))
+    const byKey = new Map<string, { url: string; fallback?: string }>()
+    for (const link of filtered) {
+      const key = (normalizeUrl(link.url) ?? link.url).replace(/^https?:\/\/(www\.)?/, '')
+      const known = byKey.get(key)
+      if (!known) {
+        byKey.set(key, link)
+      } else if (!known.fallback) {
+        known.fallback = link.fallback
       }
+    }
+    const unique = [...byKey.values()]
+    const own = unique
+      .filter((link) => rank(link.url) < 2)
+      .sort((a, b) => rank(a.url) - rank(b.url))
+    const foreign = unique.filter((link) => rank(link.url) === 2)
+
+    const candidates: IDocCandidate[] = []
+    const MAX_PROBES = 5
+    let probes = 0
+    const scan = async (links: { url: string; fallback?: string }[]) => {
+      for (const { url, fallback } of links) {
+        if (probes >= MAX_PROBES) {
+          return
+        }
+        probes += 1
+        if (await isLiveDocs(url)) {
+          candidates.push(candidate(url, 'readme-scrape', true))
+        } else if (fallback && probes < MAX_PROBES) {
+          probes += 1
+          if (await isLiveDocs(fallback)) {
+            candidates.push(candidate(fallback, 'readme-scrape', true))
+          }
+        }
+      }
+    }
+    await scan(own)
+    if (candidates.length === 0) {
+      probes = 0
+      await scan(foreign)
     }
     return candidates
   } catch {
