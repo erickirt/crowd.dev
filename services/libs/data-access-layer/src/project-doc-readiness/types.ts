@@ -92,3 +92,7 @@ export interface IProjectForDocsDiscovery {
   name: string
   website: string | null
 }
+
+export interface IProjectForDocsDiscoveryWithSharedCount extends IProjectForDocsDiscovery {
+  websiteSharedCount: number
+}

@@ -59,6 +59,7 @@ describe('scoreProject', () => {
   test('throws a non-retryable failure when the project does not exist', async () => {
     mocks.findProjectForDocsDiscovery.mockResolvedValue(null)
     await expect(scoreProject('missing', 'run-1', RESOLVED)).rejects.toThrow()
+    expect(mocks.findProjectForDocsDiscovery).toHaveBeenCalledWith(expect.anything(), 'missing')
     expect(mocks.runChecks).not.toHaveBeenCalled()
   })
 
