@@ -9,6 +9,7 @@ import {
   IProjectForDocsDiscoveryWithSharedCount,
   IProjectForDocsReadiness,
   NO_DOCS_URL_ERROR,
+  REPO_ONLY_ERROR,
 } from './types'
 
 const READINESS_COLUMNS = [
@@ -238,7 +239,10 @@ export async function findProjectsForDocsReadiness(
         OR (
           latest."ok" IS DISTINCT FROM TRUE
           AND (
-            latest."error" IS DISTINCT FROM $(noDocsUrlError)
+            (
+              latest."error" IS DISTINCT FROM $(noDocsUrlError)
+              AND latest."error" IS DISTINCT FROM $(repoOnlyError)
+            )
             OR EXISTS (
               SELECT 1 FROM "projectDocOverrides" o
               WHERE o."projectId" = p."id" AND o."active"
@@ -254,6 +258,7 @@ export async function findProjectsForDocsReadiness(
       lfOnly: scope === 'lf',
       incremental: mode === 'incremental',
       noDocsUrlError: NO_DOCS_URL_ERROR,
+      repoOnlyError: REPO_ONLY_ERROR,
       afterId: afterId ?? null,
       limit,
     },
